@@ -1,5 +1,5 @@
 # Black-Litterman code for US Equity python (BL_Equity.py)
-# Copyright (c) Xuefei Liu, 2015.
+# Copyright (c) Xuefei Liu, 2016.
 #This package has the following contributes: 
 #1. Get dataframe from US Equity and tranform the price series into covariance matrix and risk aversion coeff needed in the BlackLitterman inputs
 #2. Quantify the subjective views in a csv file and output the view in a dataframe which makes the input P, Q, Omega needed in the BlackLitterman inputs obvious
