@@ -1,0 +1,86 @@
+"""
+Id:          $Id: $
+Copyright:   2020 J.P. Morgan Chase & Co. Incorporated.  All rights reserved.
+Type:        please choose one of lib.docstring.ALL_MODULE_TYPES
+Sensitive:   "QR Rates"
+Flags:       auto-format py3-syntax
+Description: Undocumented module created by xuefei.liu
+"""
+from   __future__ import division, print_function
+import pandas as pd
+import datetime
+import time
+import pytz
+import calendar
+
+class Symbols():
+    def __init__(self,date,pathprefix = 'H:\\xuefei\\qishi\\qishi_data'):
+        self.date = date
+        self.symbolstats = {}
+        self.prefix = pathprefix
+        self.lunchTime = [datetime.time(11,30,0),datetime.time(13,0,0)]
+        self.tzLocal = pytz.timezone("Asia/Shanghai")
+
+    def epoch2time(self,epoch):
+        epoch= epoch/1000000.0
+        timeString = datetime.datetime.fromtimestamp(epoch,self.tzLocal).strftime('%Y-%m-%d %H:%M:%S.%f')
+        time = datetime.datetime.strptime(timeString, '%Y-%m-%d %H:%M:%S.%f')
+        return time
+
+    def time2epoch(self,t):
+        t = self.tzLocal.localize(t)
+        return int(calendar.timegm(t.utctimetuple())*1000000)
+
+    def quoteUpdate(self,symbol,quote):
+        """whenever a new quote comes, updates quote state"""
+        pass
+
+    def lunchBreak(self):
+        t = [datetime.datetime.combine(self.date,time) for time in self.lunchTime]
+        return [self.time2epoch(i) for i in t]
+
+    #def quoteSpreadUpdate(self,symbol):
+    #    """if quote updates, update spread"""
+    #    pass
+
+    #def getQuoteState(self,symbol,time):
+    #    """get quote states at ant given time"""
+    #    pass
+
+    def tradeUpdate(self,symbol,trade):
+        """whenever a new trade comes, updates quote state"""
+        pass
+
+    #def tradeSpreadUpdate(self,symbol):
+    #    """if trade updates, update spread"""
+    #    pass
+
+    def getState(self,symbol,time):
+        """get trade states at ant given time"""
+        pass
+
+    def bucketState(self,symbol,bucket):
+        pass
+
+    def mergeUpdate(self):
+        """merge daily quote and trade data and run quoteUpdate and tradeUpdate for daily merged data.
+           If the quote and trade events have the same timestamp, process trade first""" 
+        quoteFile = self.prefix + '\\' + str(self.date) + '.' + 'quote' + '.csv'
+        tradeFile = self.prefix + '\\' + str(self.date) + '.' + 'trade' + '.csv'
+
+        quote = pd.read_csv(quoteFile)
+        trade = pd.read_csv(tradeFile)
+        
+        lowerTime,upperTime = self.lunchBreak()
+
+        quote = quote[(quote.recv_time<lowerTime) | (quote.recv_time>upperTime) ]
+        trade = trade[(trade.recv_time<lowerTime) | (trade.recv_time>upperTime) ]
+
+        trade = trade.groupby(['recv_time', 'symbol', 'trade_price']).sum().reset_index()
+        data = trade.merge(quote,how = 'outer')
+        return data
+
+def test():
+    s = Symbols(datetime.date(2019,9,3))
+    data = s.mergeUpdate()
+    return data
