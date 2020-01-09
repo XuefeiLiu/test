@@ -1,0 +1,143 @@
+"""
+Id:          $Id: $
+Copyright:   2020 J.P. Morgan Chase & Co. Incorporated.  All rights reserved.
+Type:        lib
+Sensitive:   "QR Rates"
+Flags:       auto-format py3-syntax
+Description: trading signal module created by xuefei.liu
+"""
+from   __future__ import division, print_function
+import datetime
+import pandas as pd
+from users.w550113.quoteupdate import TAQData
+class TradingSignal(object):
+    def __init__(self,symbol,date):
+        self.symbol = symbol
+        self.date = date
+        self.stats = TAQData(date)
+
+class VolumeSignal(TradingSignal):
+    def __init__(self,symbol,date):
+        super(VolumeSignal, self).__init__(symbol,date)
+
+    def AverageHighVolume(self,numberOfPreviousday,multiplier=2):
+        """The minute spread is x times larger than previous m days"""
+        currentVolume = self.stats.singleStockMinVolume(self.symbol,self.date)
+        index = self.stats.dateList.index(self.date)
+        previousDateList = self.stats.dateList[index-numberOfPreviousday:index]
+        previousVolumeList = []
+        for date in previousDateList:
+            volume = self.stats.singleStockMinVolume(self.symbol,date)
+            vtradeDateTime = list(volume.index)
+            vtradeTime = [i.time() for i in vtradeDateTime]
+            volume.index = vtradeTime
+            previousVolumeList.append(volume)
+        df =  pd.concat(previousVolumeList,axis = 1)
+        average = df.mean(axis = 1)
+        average.name = 'averageVolume'
+        average.index= [datetime.datetime.combine(self.date,i) for i in average.index]
+        signal = pd.concat([currentVolume,average], axis=1)
+        signal = signal.dropna()
+        #signal['volume_ratio'] = signal['trade_qty']/ signal['average']           
+        def f(row):
+            if row['trade_qty'] > multiplier*row['averageVolume']:
+                return 1
+            else:
+                return 0
+        signal['volumeSignal'] = signal.apply(f, axis=1)
+        return signal
+
+class SpreadSignal(TradingSignal):
+    def __init__(self,symbol,date):
+        super(SpreadSignal, self).__init__(symbol,date)
+
+    def AverageHighSpread(self,numberOfPreviousday=5,multiplierHigh =2,multiplierLow = 0.5):
+        """The minute spread is x times larger than previous m days"""
+        currentSpread = self.stats.singleStockMinSpread(self.symbol,self.date)
+        index = self.stats.dateList.index(self.date)
+        previousDateList = self.stats.dateList[index-numberOfPreviousday:index]
+        previousSpreadList = []
+        for date in previousDateList:
+            spread = self.stats.singleStockMinSpread(self.symbol,date)
+            squoteDateTime = list(spread.index)
+            squoteTime = [i.time() for i in squoteDateTime]
+            spread.index = squoteTime
+            previousSpreadList.append(spread)
+        df =  pd.concat(previousSpreadList,axis = 1)
+        average = df.mean(axis = 1)
+        average.name = 'averageSpread'
+        average.index= [datetime.datetime.combine(self.date,i) for i in average.index]
+        signal = pd.concat([currentSpread,average], axis=1)
+        signal = signal.dropna()
+        #signal['spread_ratio'] = signal['spread']/ signal['average']
+        def f(row):
+            if row['spread'] > multiplierHigh * row['averageSpread']:
+                return 1
+            elif row['spread'] < multiplierLow * row['averageSpread']:
+                return 1
+            else:
+                return 0
+        signal['spreadSignal'] = signal.apply(f, axis=1)
+        return signal
+
+class MomentumSignal(TradingSignal):
+    def __init__(self,symbol,date):
+        super(MomentumSignal, self).__init__(symbol,date)
+
+    def momentumStats(self,date,startTime,endTime):
+        """The minute spread is x times larger than previous m days"""
+        momentum = self.stats.singleStockTradeTstats(self.symbol,date,startTime,endTime)
+        return momentum[0]
+
+class CorrelationDetection():
+    def __init__(self,startDate,endDate,numberOfPreviousday,symbols = None):
+        self.startDate = startDate
+        self.endDate = endDate
+        self.stats = TAQData(startDate)
+        self.numberOfPreviousday = numberOfPreviousday
+        if not symbols:
+            self.symbols = self.stats.symbolList
+        else:
+            self.symbols = symbols
+
+    def singleStockSpreadVolumeVSMomentum(self,symbol,date,numberOfPreviousday,spreadMultiplierHigh,spreadMultiplierLow,momentumTimeRange):
+        s = SpreadSignal(symbol,date)
+        spreadSignal = s.AverageHighSpread(numberOfPreviousday,spreadMultiplierHigh,spreadMultiplierLow)
+        v = VolumeSignal(symbol,date)
+        volumeSignal = v.AverageHighVolume(numberOfPreviousday,spreadMultiplierHigh)
+        signal = pd.concat([spreadSignal,volumeSignal], axis = 1)
+        signal = signal[(signal.index > datetime.datetime.combine(date,datetime.time(9,30))) & (signal['spreadSignal'] == 1) & (signal['volumeSignal'] ==1)]
+        if signal.empty:
+            return signal
+        #the spread before market opens is too volatile, we only consider spread after that
+        m = MomentumSignal(symbol,date)
+        statList = []
+        for startTime in signal.index:
+            endTime = startTime +  datetime.timedelta(minutes = 30)
+            statList.append(m.momentumStats(startTime.date(),startTime.time(),endTime.time()))
+        signal['momentum'] = statList
+        signal['symbol'] = symbol
+        return signal
+
+    def spreadVolumeVSMomentum(self,spreadMultiplierHigh,spreadMultiplierLow,momentumTimeRange):
+        dateList = [datetime.date(2019,9,10)]#self.stats.dateList
+        symbolList = self.symbols[:20]
+        result = []
+        for date in dateList:
+            for symbol in symbolList:
+                result.append(self.singleStockSpreadVolumeVSMomentum(symbol,date,self.numberOfPreviousday,spreadMultiplierHigh,spreadMultiplierLow,momentumTimeRange))
+        return pd.concat(result)
+
+
+
+
+        
+
+
+
+
+def test():
+    #s = MomentumSignal('002545.SZ',datetime.date(2019,9,10))
+    #return s. momentumStats(datetime.date(2019,9,10),datetime.time(11,16,0),datetime.time(12,16,0))
+    c = CorrelationDetection(datetime.date(2019,9,6),datetime.date(2019,9,30),5)
+    return c.spreadVolumeVSMomentum(2,0.6,1)
