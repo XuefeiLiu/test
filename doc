@@ -1,0 +1,48 @@
+TAQ library document
+
+TAQ data is processed and its corresponding statistics is calculated in class TAQData.
+
+Assumption:
+1.	For a quote, if there is only one bid/one ask, we remove this from quote. The reason is that we can’t get a meaningful bid ask spread here. This kind of quote always exists before market opening.
+Callback interface:
+I offer two kinds of interface to merge quote and trade data.
+1.	Quote and trade comes in stream. Our API/IO receives stream from exchange and process quote and trade together to merge with the current merged results. This is for live intraday merging.
+Method is updateStreamData
+
+2.	Quote and trade is stored in database and we do analytics after trade, which is the case for our exercise. We can merge quote and trade dataframe directly and sort by recv_time. This way is faster in python
+
+Method is preProcessData 
+
+
+
+Question 1
+The method to calculate time weighted average spread is in function singleStockMinSpread. 
+I use 1*60*1000000 microseconds as the fixed denominator in the weight calculation
+I use an exponential function to fit the curve, because spread has a great decay at the market opening.
+
+Question 2-4
+The instruction is in the code comment.
+
+
+Question 5
+5.1	Definition
+Abnormal volume: current minute volume is 2-times higher than the previous 5-day average at the same minute.
+Abnormal spread: current minute spread is 2-times higher or 0.6-times lower than the previous 5-day average at the same minute.
+
+Momentum Symbol: t-stat of forward 1-hours' 1-minute/5-minute return is high. The benchmark is chosen as1.96 
+
+5.2	Method
+To test correlation
+5.3	
+
+
+Question 6 
+I use 1 min median spread for this question. The method to estimate median spread at any given time is to first get the spreads in the [givenTime – 30s, givenTime+30s] range for the past five days. Then we can get the median of the five days spread. Finally, calculate the median of these 5 median as an estimate. I use the median absolute deviation as the error estimation term.
+
+Question7
+
+When new data source comes such as BookData in the code, just inherit the parent DataProcessInterface interface.
+When we do analysis, we can merge the dataframe generated from different source by recv_time and symbol.  
+
+
+
