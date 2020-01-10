@@ -66,7 +66,7 @@ class TradeSignal(object):
         trade = trade[["Time", "symbol", "trade_price"]].set_index("Time")
         trade = trade.groupby('symbol')
 
-        trade = trade.resample('min',how = 'last')
+        trade = trade.resample('min' )
         trade  = trade .dropna()
         trade['1minreturn'] = np.log(trade['trade_price']).diff()
         trade['5minreturn'] = np.log(trade['trade_price']).diff(5)
