@@ -9,149 +9,144 @@ Description: trading signal module created by xuefei.liu
 from   __future__ import division, print_function
 import datetime
 import pandas as pd
-from random import sample 
-from users.w550113.quoteupdate import TAQData
-class TradingSignal(object):
-    def __init__(self,symbol,date):
-        self.symbol = symbol
+import numpy as np
+from users.w550113.quoteupdate import epoch2time, time2epoch
+import pickle
+import os
+import os.path
+import pytz
+
+class TradeSignal(object):
+    def __init__(self,date,prefix = "H:\\xuefei\\qishi\\qishi_data"):
         self.date = date
-        self.stats = TAQData(date)
+        self.prefix = prefix
+        self.lunchTime = [datetime.time(11, 30, 0), datetime.time(13, 0, 0)]
+        self.tzLocal = pytz.timezone("Asia/Shanghai")
 
-class VolumeSignal(TradingSignal):
-    def __init__(self,symbol,date):
-        super(VolumeSignal, self).__init__(symbol,date)
+    def lunchBreak(self):
+        """lunch break in epoch time"""
+        t = [datetime.datetime.combine(self.date, time) for time in self.lunchTime]
+        return [time2epoch(i,self.tzLocal) for i in t]
 
-    def AverageHighVolume(self,numberOfPreviousday,multiplier=2):
+
+    def getSpread(self,date):
+        quote = pd.read_csv(self.prefix +"\\"  + str(date) + ".quote.csv")
+        lowerTime, upperTime = self.lunchBreak()
+        quote = quote[(quote.recv_time < lowerTime) | (quote.recv_time > upperTime)]
+        quote = quote[ (quote["ask_price"] > 0) & (quote["bid_price"] > 0)]  # if only bid or ask exists, there is no spread
+        quote["spread"] = (quote["ask_price"] - quote["bid_price"]) / (quote["ask_price"] + quote["bid_price"])
+        quote["Time"] = quote["recv_time"].apply(epoch2time)
+        quote = quote[["Time", "symbol", "spread"]].set_index("Time")
+        quote = quote.groupby('symbol').resample('1min')
+        quote = quote.dropna()
+        with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "wb") as output_file:
+            pickle.dump(quote,output_file)
+
+    def getVolume(self,date):
+        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv") 
+        lowerTime, upperTime = self.lunchBreak()
+        trade = trade[(trade.recv_time < lowerTime) | (trade.recv_time > upperTime)]
+        trade = trade.groupby(["recv_time", "symbol", "trade_price"]).sum().reset_index()
+        trade["Time"] = trade["recv_time"].apply(epoch2time)
+        trade = trade[["Time", "symbol", "trade_qty"]].set_index("Time")
+        trade = trade.rename(columns = {'trade_qty':'volume'})
+        trade = trade.groupby('symbol').resample('1min',how = 'sum')
+        trade = trade.dropna()
+        with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "wb") as output_file:
+            pickle.dump(trade,output_file)
+
+
+    def getReturn(self,date):
+        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv") 
+        lowerTime, upperTime = self.lunchBreak()
+        trade = trade[(trade.recv_time < lowerTime) | (trade.recv_time > upperTime)]
+        trade = trade.groupby(["recv_time", "symbol", "trade_price"]).sum().reset_index()
+        trade["Time"] = trade["recv_time"].apply(epoch2time)
+        trade = trade[["Time", "symbol", "trade_price"]].set_index("Time")
+        trade = trade.groupby('symbol')
+
+        trade1min = trade.resample('min',how = 'last')
+        trade1min  = trade1min .dropna()
+        trade1min['return'] = np.log(trade1min['trade_price']).diff()
+        trade1min = trade1min.dropna()
+        trade1min = trade1min.reset_index()[["Time", "symbol",'return']]
+
+        trade5min = trade.resample('5min',how = 'last')
+        trade5min  = trade5min .dropna()
+        trade5min['return'] = np.log(trade5min['trade_price']).diff()
+        trade5min = trade5min.dropna()
+        trade5min = trade5min.reset_index()[["Time", "symbol",'return']]
+
+        with open(self.prefix + '\\stat\\' +str(date) + '.1minreturn.pickle', "wb") as output_file:
+            pickle.dump(trade1min,output_file)
+
+        with open(self.prefix + '\\stat\\' +str(date) + '.5minreturn.pickle', "wb") as output_file:
+            pickle.dump(trade5min,output_file)
+
+    def processData(self):
+        self.getSpread(self.date)
+        self.getVolume(self.date)
+        self.getReturn(self.date)
+
+    def getDateList(self):
+        """Get all date lists in universe"""
+        return sorted([datetime.datetime.strptime(i, '%Y-%m-%d').date() for i in os.listdir(self.prefix + "\\" + "splitData")])
+
+    def spreadStats(self,numberOfPreviousday=3):
         """The minute spread is x times larger than previous m days"""
-        currentVolume = self.stats.singleStockMinVolume(self.symbol,self.date)
-        index = self.stats.dateList.index(self.date)
-        previousDateList = self.stats.dateList[max(index-numberOfPreviousday,0):index]
-        previousVolumeList = []
+        with open(self.prefix + '\\stat\\' +str(self.date) + '.spread.pickle', "rb") as input_file:
+            currentSpread = pickle.load(input_file)
+        
+        dateList = self.getDateList()
+        index = dateList.index(self.date)
+        previousDateList = dateList[max(index-numberOfPreviousday,0):index]
+        
+        spreadList = []
         for date in previousDateList:
-            volume = self.stats.singleStockMinVolume(self.symbol,date)
-            vtradeDateTime = list(volume.index)
-            vtradeTime = [i.time() for i in vtradeDateTime]
-            volume.index = vtradeTime
-            previousVolumeList.append(volume)
-        df =  pd.concat(previousVolumeList,axis = 1)
-        average = df.mean(axis = 1)
-        average.name = 'averageVolume'
-        average.index= [datetime.datetime.combine(self.date,i) for i in average.index]
-        signal = pd.concat([currentVolume,average], axis=1)
-        signal = signal.dropna()
-        #signal['volume_ratio'] = signal['trade_qty']/ signal['average']           
-        def f(row):
-            if row['trade_qty'] > multiplier*row['averageVolume']:
-                return 1
-            else:
-                return 0
-        signal['volumeSignal'] = signal.apply(f, axis=1)
-        return signal
+            with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "rb") as input_file:
+                spread = pickle.load(input_file)
+                spread = spread.reset_index()
+                spread['Time'] = spread['Time'].apply(lambda x: x.time())
+                spreadList.append(spread)
 
-class SpreadSignal(TradingSignal):
-    def __init__(self,symbol,date):
-        super(SpreadSignal, self).__init__(symbol,date)
-
-    def AverageHighSpread(self,numberOfPreviousday=5,multiplierHigh =2,multiplierLow = 0.5):
-        """The minute spread is x times larger than previous m days"""
-        currentSpread = self.stats.singleStockMinSpread(self.symbol,self.date)
-        index = self.stats.dateList.index(self.date)
-        previousDateList = self.stats.dateList[max(index-numberOfPreviousday,0):index]
-        previousSpreadList = []
-        for date in previousDateList:
-            spread = self.stats.singleStockMinSpread(self.symbol,date)
-            squoteDateTime = list(spread.index)
-            squoteTime = [i.time() for i in squoteDateTime]
-            spread.index = squoteTime
-            previousSpreadList.append(spread)
-        df =  pd.concat(previousSpreadList,axis = 1)
-        average = df.mean(axis = 1)
-        average.name = 'averageSpread'
-        average.index= [datetime.datetime.combine(self.date,i) for i in average.index]
-        signal = pd.concat([currentSpread,average], axis=1)
-        signal = signal.dropna()
-        #signal['spread_ratio'] = signal['spread']/ signal['average']
-        def f(row):
-            if row['spread'] > multiplierHigh * row['averageSpread']:
-                return 1
-            elif row['spread'] < multiplierLow * row['averageSpread']:
-                return 1
-            else:
-                return 0
-        signal['spreadSignal'] = signal.apply(f, axis=1)
-        return signal
-
-    def IntralDayAbnormalSpread(self):
-        currentSpread = self.stats.singleStockMinSpread(self.symbol,self.date)
-        currentSpread = currentSpread[(currentSpread.index > datetime.datetime.combine(self.date,datetime.time(9,30)))]
-        currentSpread = pd.DataFrame(currentSpread)
-        currentSpread['rolling'] = pd.rolling_mean(currentSpread,5)
-        def f(row):
-            if row['spread'] > 1.5 * row['rolling']:
-                return 1
-            elif row['spread'] < 0.5 * row['rolling']:
-                return 1
-            else:
-                return 0
-        currentSpread['spreadSignal'] = currentSpread.apply(f, axis=1)
+        df =  pd.concat(spreadList)
+        df = df.groupby(['Time','symbol']).mean()
+        df = df.reset_index()
+        df = df.rename(columns = {'spread':'averageSpread'})
+        currentSpread = currentSpread.reset_index()
+        currentSpread['Time'] = currentSpread['Time'].apply(lambda x: x.time())
+        currentSpread = currentSpread.merge(df)
         return currentSpread
 
-class MomentumSignal(TradingSignal):
-    def __init__(self,symbol,date):
-        super(MomentumSignal, self).__init__(symbol,date)
-
-    def momentumStats(self,date,startTime,endTime):
+    def volumeStats(self,numberOfPreviousday=3):
         """The minute spread is x times larger than previous m days"""
-        momentum = self.stats.singleStockTradeTstats(self.symbol,date,startTime,endTime)
-        return momentum[0]
+        with open(self.prefix + '\\stat\\' +str(self.date) + '.volume.pickle', "rb") as input_file:
+            currentVolume = pickle.load(input_file)
+        
+        dateList = self.getDateList()
+        index = dateList.index(self.date)
+        previousDateList = dateList[max(index-numberOfPreviousday,0):index]
+        
+        volumeList = []
+        for date in previousDateList:
+            with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "rb") as input_file:
+                volume = pickle.load(input_file)
+                volume = volume.reset_index()
+                volume['Time'] = volume['Time'].apply(lambda x: x.time())
+                volumeList.append(volume)
 
-class CorrelationDetection():
-    def __init__(self,startDate,endDate,numberOfPreviousday,symbols = None):
-        self.startDate = startDate
-        self.endDate = endDate
-        self.stats = TAQData(startDate)
-        self.numberOfPreviousday = numberOfPreviousday
-        if not symbols:
-            self.symbols = self.stats.symbolList
-        else:
-            self.symbols = symbols
+        df =  pd.concat(volumeList)
+        df = df.groupby(['Time','symbol']).mean()
+        df = df.reset_index()
+        df = df.rename(columns = {'volume':'averageVolume'})
+        currentVolume = currentVolume.reset_index()
+        currentVolume['Time'] = currentVolume['Time'].apply(lambda x: x.time())
+        currentVolume = currentVolume.merge(df)
+        return currentVolume
 
-    def singleStockSpreadVolumeVSMomentum(self,symbol,date,numberOfPreviousday,spreadMultiplierHigh,spreadMultiplierLow,momentumTimeRange):
-        s = SpreadSignal(symbol,date)
-        spreadSignal = s.AverageHighSpread(numberOfPreviousday,spreadMultiplierHigh,spreadMultiplierLow)
-        #spreadSignal = s.IntralDayAbnormalSpread()
-        v = VolumeSignal(symbol,date)
-        volumeSignal = v.AverageHighVolume(numberOfPreviousday,spreadMultiplierHigh)
-        signal = pd.concat([spreadSignal,volumeSignal], axis = 1)
-        #ssignal = signal[(signal.index > datetime.datetime.combine(date,datetime.time(9,30))) & (signal['spreadSignal'] == 1) & (signal['volumeSignal'] ==1)]
-        if signal.empty:
-            return signal
-        #the spread before market opens is too volatile, we only consider spread after that
-        m = MomentumSignal(symbol,date)
-        statList = []
-        for startTime in signal.index:
-            endTime = startTime +  datetime.timedelta(hours = 1)
-            statList.append(m.momentumStats(startTime.date(),startTime.time(),endTime.time()))
-        signal['momentum'] = statList
-        signal['symbol'] = symbol
-        return signal
-
-    def spreadVolumeVSMomentum(self,spreadMultiplierHigh,spreadMultiplierLow,momentumTimeRange):
-        dateList = sample(self.stats.dateList,3)
-        symbolList = sample(self.symbols,5)
-        result = []
-        for date in dateList:
-            for symbol in symbolList:
-                print(date,symbol)
-                result.append(self.singleStockSpreadVolumeVSMomentum(symbol,date,self.numberOfPreviousday,spreadMultiplierHigh,spreadMultiplierLow,momentumTimeRange))
-        return pd.concat(result)
-
-    def testCorrelation(self,data):
-        pass
-
-
-
-
+    def momentumStats(self,startTime,delta):
+        with open(self.prefix + '\\stat\\' +str(self.date) + '.spread.pickle', "rb") as input_file:
+            currentSpread = pickle.load(input_file)
 
 
         
@@ -160,10 +155,8 @@ class CorrelationDetection():
 
 
 def test():
-    #s = MomentumSignal('002545.SZ',datetime.date(2019,9,10))
-    #return s. momentumStats(datetime.date(2019,9,10),datetime.time(11,16,0),datetime.time(12,16,0))
-    c = CorrelationDetection(datetime.date(2019,9,6),datetime.date(2019,9,30),5)
-    return c.spreadVolumeVSMomentum(2,0.6,1)
-    #s = SpreadSignal('002545.SZ',datetime.date(2019,9,10))
+
+    s = TradeSignal(datetime.date(2019,9,10))
     #spread =  s.IntralDayAbnormalSpread()
-    #return spread
+    #return s.getSpread(s.date)
+    return s.getReturn(datetime.date(2019,9,10))
