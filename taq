@@ -243,7 +243,7 @@ class TAQData(DataProcessInterface):
         """two sample t stats of 1 min return and 5 min return for single stock"""
 
         trade = self.getTrade(symbol, date)
-        trade = trade.resample("1min",how = 'last')
+        trade = trade.resample("1min")
         trade = trade.dropna()
 
         trade['1minreturn'] = np.log(trade['trade_price']).diff()
