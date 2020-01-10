@@ -1,157 +1,409 @@
 """
-Id:          $Id: $
+Id:          $Id: quoteupdate.py,v 1.2 2020/01/08 12:34:12 xuefei.liu Exp $
 Copyright:   2020 J.P. Morgan Chase & Co. Incorporated.  All rights reserved.
-Type:        lib
+Type:        app
 Sensitive:   "QR Rates"
 Flags:       auto-format py3-syntax
-Description: trading signal module created by xuefei.liu
+Description: qishi project to deal with trade and quote module created by xuefei.liu
 """
-from   __future__ import division, print_function
-import datetime
+from __future__ import division, print_function
 import pandas as pd
-import numpy as np
-from users.w550113.quoteupdate import epoch2time, time2epoch
-import pickle
+import datetime
+import time
+import pytz
+import calendar
 import os
 import os.path
-import pytz
+import numpy as np
+import matplotlib.pyplot as plt
+from builtins import zip
+import scipy.stats as stats
+import collections
+from statsmodels import robust
+from scipy.interpolate import pchip
+import pickle
 
-class TradeSignal(object):
-    def __init__(self,prefix = "H:\\xuefei\\qishi\\qishi_data"):
-        self.prefix = prefix
+Quote = collections.namedtuple('Quote',['recv_time','symbol','ask_price', 'ask_size', 'bid_price', 'bid_size'])
+
+Trade = collections.namedtuple('Trade',['recv_time','symbol','trade_price', 'trade_qty'])
+
+def epoch2time(epoch,tzLocal = pytz.timezone("Asia/Shanghai")):
+    """convert epoch time to local time"""
+    epoch = epoch / 1000000.0
+    timeString = datetime.datetime.fromtimestamp(epoch, tzLocal).strftime("%Y-%m-%d %H:%M:%S.%f")
+    time = datetime.datetime.strptime(timeString, "%Y-%m-%d %H:%M:%S.%f")
+    return time
+
+def time2epoch(t,tzLocal = pytz.timezone("Asia/Shanghai")):
+    """convert local time to epoch time"""
+    t = tzLocal.localize(t)
+    return int(calendar.timegm(t.utctimetuple()) * 1000000)
+
+class DataProcessInterface(object):
+    def __init__(self,date):
+        self.date = date
+
+    def getLatestData(self):
+        """get the latest processed data, must have column time and symbol
+        """
+        raise NotImplementedError( "getLatestData not implemented in abstract base class DataProcessInterface" )
+
+
+    def getSymbolStas(self,symbol,date):
+        """
+        return the statistics of one symbol in one date
+        """
+        raise NotImplementedError( "getSymbolStas not implemented in abstract base class DataProcessInterface" )
+
+class TAQData(DataProcessInterface):
+    def __init__(self, date, pathprefix="H:\\xuefei\\qishi\\qishi_data"):
+        super(TAQData,self).__init__(date)
+        self.prefix = pathprefix
         self.lunchTime = [datetime.time(11, 30, 0), datetime.time(13, 0, 0)]
         self.tzLocal = pytz.timezone("Asia/Shanghai")
+        self.symbolList = self.getSymbolList()
+        self.dateList = self.getDateList()
+        self.mergedSeries = pd.DataFrame()
 
-    def lunchBreak(self,date):
+    #time util func
+    #def epoch2time(self, epoch):
+    #    """convert epoch time to local time"""
+    #    epoch = epoch / 1000000.0
+    #    timeString = datetime.datetime.fromtimestamp(epoch, self.tzLocal).strftime("%Y-%m-%d %H:%M:%S.%f")
+    #    time = datetime.datetime.strptime(timeString, "%Y-%m-%d %H:%M:%S.%f")
+    #    return time
+
+    #def time2epoch(self, t):
+    #    """convert local time to epoch time"""
+    #    t = self.tzLocal.localize(t)
+    #    return int(calendar.timegm(t.utctimetuple()) * 1000000)
+
+    def lunchBreak(self):
         """lunch break in epoch time"""
-        t = [datetime.datetime.combine(date, time) for time in self.lunchTime]
+        t = [datetime.datetime.combine(self.date, time) for time in self.lunchTime]
         return [time2epoch(i,self.tzLocal) for i in t]
 
+    def preProcessData(self):
+        """If the data is stored already, we can process them all together which is the case for this exercise.
+           Merge daily quote and trade data and run quoteUpdate and tradeUpdate for daily merged data.
+           If the quote and trade events have the same timestamp, process trade first"""
+        quoteFile = self.prefix + "\\" + str(self.date) + "." + "quote" + ".csv"
+        tradeFile = self.prefix + "\\" + str(self.date) + "." + "trade" + ".csv"
 
-    def getSpread(self,date):
-        quote = pd.read_csv(self.prefix +"\\"  + str(date) + ".quote.csv")
-        lowerTime, upperTime = self.lunchBreak(date)
+        quote = pd.read_csv(quoteFile)
+        trade = pd.read_csv(tradeFile)
+
+        lowerTime, upperTime = self.lunchBreak()
+
         quote = quote[(quote.recv_time < lowerTime) | (quote.recv_time > upperTime)]
-        quote = quote[ (quote["ask_price"] > 0) & (quote["bid_price"] > 0)]  # if only bid or ask exists, there is no spread
-        quote["spread"] = (quote["ask_price"] - quote["bid_price"]) / (quote["ask_price"] + quote["bid_price"])
-        quote["Time"] = quote["recv_time"].apply(epoch2time)
-        quote = quote[["Time", "symbol", "spread"]].set_index("Time")
-        quote = quote.groupby('symbol').resample('1min')
-        quote = quote.dropna()
-        quote = quote.reset_index()
-        with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "wb") as output_file:
-            pickle.dump(quote,output_file)
-
-    def getVolume(self,date):
-        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv")
-        lowerTime, upperTime = self.lunchBreak(date)
         trade = trade[(trade.recv_time < lowerTime) | (trade.recv_time > upperTime)]
+
         trade = trade.groupby(["recv_time", "symbol", "trade_price"]).sum().reset_index()
-        trade["Time"] = trade["recv_time"].apply(epoch2time)
-        trade = trade[["Time", "symbol", "trade_qty"]].set_index("Time")
-        trade = trade.rename(columns = {'trade_qty':'volume'})
-        trade = trade.groupby('symbol').resample('1min',how = 'sum')
+
+        assert trade[(trade["trade_price"].notnull()) & (trade["trade_qty"].isnull())].shape[0] == 0
+        assert trade[(trade["trade_price"].isnull()) & (trade["trade_qty"].notnull())].shape[0] == 0
+        data = trade.append(quote)
+
+        symbolData = list(data.groupby("symbol"))
+
+        for data in symbolData:
+            symbol = data[0]
+            df = data[1]
+            df = df.sort_values(["recv_time", "trade_price"], na_position="last")
+            dirName = self.prefix + "\\" + "splitData\\" + str(self.date) + "\\" + symbol
+
+            if not os.path.exists(dirName):
+                os.makedirs(dirName)
+            df.to_csv(self.prefix + "\\" + "splitData\\" + str(self.date) + "\\" + symbol + "\\" + "rawdata.csv")
+        self.mergedSeries = self.mergedSeries.append(df)
+
+    def updateData(self,quote,trade):
+        """suppose the data from the two source comes in stream, we process them sequentially """
+        if quote and not trade:
+            self.updateQuote(quote)
+        elif trade and not quote:
+            self.updateTrade(trade)
+        elif trade and quote:
+            self.updateTrade(trade)
+            self.updateQuote(quote)
+
+    def updateQuote(self,Quote):
+        """update results with new Quote"""
+        newQuote = pd.DataFrame(data=Quote)
+        self.mergedSeries = self.mergedSeries.append(newQuote)
+
+    def updateTrade(self,Trade):
+        """update results with new Trade"""
+        newTrade = pd.DataFrame(data=Trade)
+        self.mergedSeries = self.mergedSeries.append(newTrade)
+
+    def getLatestData(self):
+        """implement the getLatestData"""
+        return self.mergedSeries
+
+
+    def getQuote(self, symbol, date):
+        """get the quote data given date and symbol"""
+        data = pd.read_csv(self.prefix + "\\" + "splitData\\" + str(date) + "\\" + symbol + "\\" + "rawdata.csv")
+        quote = data[~(data["trade_price"] > 0) & (data["ask_price"] > 0) & (data["bid_price"] > 0)][
+            ["recv_time", "ask_price", "ask_size", "bid_price", "bid_size"]
+        ]  # if only bid or ask exists, there is no spread
+        quote["spread"] = quote["ask_price"] - quote["bid_price"]
+        quote["Time"] = quote["recv_time"].apply(epoch2time,args = (self.tzLocal,) )
+        quote = quote[["Time", "spread", "ask_price", "ask_size", "bid_price", "bid_size"]].set_index("Time")
+        return quote
+
+    def getTrade(self, symbol, date):
+        """get the trade data given date and symbol"""
+        data = pd.read_csv(self.prefix + "\\" + "splitData\\" + str(date) + "\\" + symbol + "\\" + "rawdata.csv")
+        trade = data[(data["trade_price"] > 0)][["recv_time", "trade_price", "trade_qty"]]
+        trade["Time"] = trade["recv_time"].apply(epoch2time,args = (self.tzLocal,))
+        trade = trade[["Time", "trade_price", "trade_qty"]].set_index("Time")
+        return trade
+
+    def getSymbolList(self):
+        """Get all stock lists in universe"""
+        return os.listdir(self.prefix + "\\" + "splitData\\" + str(self.date))
+
+    def getDateList(self):
+        """Get all date lists in universe"""
+        return sorted([datetime.datetime.strptime(i, '%Y-%m-%d').date() for i in os.listdir(self.prefix + "\\" + "splitData")])
+
+    def spreadOnQuoteUpdate(self, symbol, date):
+        """get median spread when quote changes"""
+        quote = self.getQuote(symbol, date)
+        quote = quote.drop_duplicates()
+        return quote.spread.median()
+
+    def spreadOnTradeUpdate(self, symbol, date):
+        """get median spread when quote changes"""
+        data = pd.read_csv(self.prefix + "\\" + "splitData\\" + str(date) + "\\" + symbol + "\\" + "rawdata.csv")
+        data = data[(data["trade_price"] > 0) | (data["ask_price"] > 0) & (data["bid_price"] > 0)]
+        data = data[["recv_time", "trade_price", "trade_qty", "ask_price", "bid_price"]].set_index("recv_time")
+        data["spread"] = data["ask_price"] - data["bid_price"]
+        data = data[["spread", "trade_price", "trade_qty"]]
+        data["spread"] = data["spread"].fillna(method="ffill")  # when trades happen, the quote should be the most recent quote
+        data = data.dropna(subset=["trade_price", "trade_qty"])  # remove all non trades records
+        return data.spread.median()
+
+    def getSymbolStats(self, symbol, date):
+        """get daily average spread,volume and volatility for every symbol in min level"""
+        quote              = self.getQuote(symbol, date)
+        spread             = quote["spread"].resample("1min").mean()
+        trade              = self.getTrade(symbol, self.date)
+        volume             = trade["trade_qty"].resample("1min").mean()
+        ohlc               = trade["trade_price"].resample("1min", how="ohlc")
+        ohlc               = ohlc.dropna()
+        ohlc["shiftclose"] = ohlc["close"].shift(1)
+        ohlc               = ohlc.dropna()
+        ohlc["volComponent"] = (
+            np.square(np.log(ohlc["open"]) - np.log(ohlc["shiftclose"]))
+            + 0.5 * np.square(np.log(ohlc["high"]) - np.log(ohlc["low"]))
+            - (2 * np.log(2) - 1) * np.square(np.log(ohlc["close"]) - np.log(ohlc["open"]))
+        )
+        volatility = np.sqrt(ohlc["volComponent"].sum() / ohlc.shape[0])
+        return spread, volume, volatility
+
+    def singleStockDollarValue(self,symbol,date):
+        """get dollar value of a single stock per day"""
+        trade = self.getTrade(symbol, self.date)
+        dollarValue = sum(trade["trade_price"] * trade["trade_qty"])
+        return  dollarValue
+
+    #min stats for single stock
+    def singleStockMinSpread(self, symbol,date):
+        """Single stock time weighted average spread"""
+
+        quote = self.getQuote(symbol, date)
+        def func(df):
+            """
+                Time weighted function
+                Suppose threre are N points in the 1 minute bucket, t1,t2,...,tn.
+                The start and end of the interval are t0 and tN, tN-t0 = 1 min.
+                The the time weighted average is defined as:
+                sum(BAS_1 * (t2-t1) + BAS_2 * (t3-t2) +....+BAS_n * (tN-t_n))/(tN - t1)
+
+            """
+            if df.size == 0: return
+            #lastIndex is the minute boundary tN, like 2019-09-02 09:35:00
+            lastIndex = df.index[-1] - pd.Timedelta(seconds=df.index[-1].second,microseconds = df.index[-1].microsecond) + pd.Timedelta(minutes=1)
+            df = df.append(pd.Series(0,index = [lastIndex]))
+            return np.average(df.values[:-1], weights=np.diff(df.index.asi8))
+        minuteQuote = quote['spread'].resample("1min",how = func)
+        return minuteQuote
+
+
+    def singleStockMinVolume(self,symbol,date):
+        """average volume per minute for single stock"""
+        trade              = self.getTrade(symbol, date)
+        volume             = trade["trade_qty"].resample("1min")
+        return volume
+
+    def singleStockTradeTstats(self,symbol,date):
+        """two sample t stats of 1 min return and 5 min return for single stock"""
+
+        trade = self.getTrade(symbol, date)
+        trade = trade.resample("1min",how = 'last')
         trade = trade.dropna()
-        trade = trade.reset_index()
-        with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "wb") as output_file:
-            pickle.dump(trade,output_file)
 
-
-    def getReturn(self,date):
-        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv")
-        lowerTime, upperTime = self.lunchBreak(date)
-        trade = trade[(trade.recv_time < lowerTime) | (trade.recv_time > upperTime)]
-        trade = trade.groupby(["recv_time", "symbol", "trade_price"]).sum().reset_index()
-        trade["Time"] = trade["recv_time"].apply(epoch2time)
-        trade = trade[["Time", "symbol", "trade_price"]].set_index("Time")
-        trade = trade.groupby('symbol')
-
-        trade = trade.resample('min',how = 'last')
-        trade  = trade .dropna()
         trade['1minreturn'] = np.log(trade['trade_price']).diff()
         trade['5minreturn'] = np.log(trade['trade_price']).diff(5)
         trade = trade.dropna()
         trade['1/5minreturn'] = trade['1minreturn']/trade['5minreturn']
         trade = trade.replace([np.inf, -np.inf], np.nan)
         trade = trade.dropna()
-        trade = trade.reset_index()
-        with open(self.prefix + '\\stat\\' +str(date) + '.momentum.pickle', "wb") as output_file:
-            pickle.dump(trade,output_file)
+        return stats.ttest_1samp(trade['1/5minreturn'].values,0).statistic
 
 
-    def processData(self,date):
-        self.getSpread(date)
-        self.getVolume(date)
-        self.getReturn(date)
+    #Answers to question 1-4 and 6 below
 
-    def getDateList(self):
-        """Get all date lists in universe"""
-        return sorted([datetime.datetime.strptime(i, '%Y-%m-%d').date() for i in os.listdir(self.prefix + "\\" + "splitData")])
 
-    def spreadStats(self,date,numberOfPreviousday=3):
-        """The minute spread is x times larger than previous m days"""
-        with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "rb") as input_file:
-            currentSpread = pickle.load(input_file)
+    def curveFit(self,df,num,premarket):
+        """fit curve with cubic spline"""
+        xdata1 = [time2epoch(i,self.tzLocal) for i in df.index if i.time() <=datetime.time(11,30) ]
+        xdata2 = [time2epoch(i,self.tzLocal) for i in df.index if i.time() >=datetime.time(13,0) ]
+        xdata = xdata1+xdata2
+        spline = pchip(xdata, df.spread)
+        if premarket:
+            xs = np.linspace(min(xdata1),max(xdata1),num)
+        else:
+            xs1 = np.linspace(min(xdata1),max(xdata1),num)
+            xs2 = np.linspace(min(xdata2),max(xdata2),num)
+            xs =  np.append(xs1,xs2)
+        t = [epoch2time(i,self.tzLocal) for i in xs]
+        return t,spline(xs)
 
-        dateList = self.getDateList()
-        index = dateList.index(date)
-        previousDateList = dateList[max(index-numberOfPreviousday,0):index]
+    def dollarVolumeWeightedSpread(self):
+        """dollar volume weighted spread. Use monotonic interpolators to fit curve to avoid negative spread. For question 1"""
 
+        #symbols = self.getSymbolList()
+        #total = 0
+        #quote = []
+        #for symbol in symbols:
+        #    minuteQuote = self.singleStockMinSpread(symbol,self.date)
+        #    minuteQuote = minuteQuote.dropna()
+        #    dollarValue = self.singleStockDollarValue(symbol,self.date)
+        #    total += dollarValue
+        #    quote.append(minuteQuote * dollarValue)
+        #df = pd.concat(quote, axis=1)
+
+        with open('H:\\xuefei\\qishi\\result\\twapspread.pickle', "rb") as input_file:
+            df = pickle.load(input_file)
+        total = 70147567346.509949
+        df = df[(df.index<=datetime.datetime.combine(self.date,datetime.time(11,30))) | (df.index>=datetime.datetime.combine(self.date,datetime.time(13,0)))]
+        result = df.fillna(method="ffill").sum(axis=1) / total
+
+        result1 = result[result.index<=datetime.datetime.combine(self.date,datetime.time(9,30))]
+        result2 = result[result.index>datetime.datetime.combine(self.date,datetime.time(9,30))]
+
+        result1 = pd.DataFrame(result1,columns = ['spread'])
+        result2 = pd.DataFrame(result2,columns = ['spread'])
+
+        plt.figure(figsize=(6.5, 4))
+        plt.plot(result1.index, result1.spread, 'o', label='data')
+        x1,y1 = self.curveFit(result1,30,True)
+        plt.plot(x1,y1 )
+        plt.show()
+
+        plt.figure(figsize=(6.5, 4))
+        plt.plot(result2.index, result2.spread, 'o', label='data')
+        x2,y2 = self.curveFit(result2,120,False)
+        plt.plot(x2,y2 )
+        plt.show()
+        return result1,result2
+
+    def minuteStats(self):
+        """Compute daily average of minute stats: volume, spread, volatility. For question 2"""
+        symbols = self.symbolList
         spreadList = []
-        for d in previousDateList:
-            with open(self.prefix + '\\stat\\' +str(d) + '.spread.pickle', "rb") as input_file:
-                spread = pickle.load(input_file)
-                spread['Time'] = spread['Time'].apply(lambda x: x.time())
-                spreadList.append(spread)
-
-        df =  pd.concat(spreadList)
-        df = df.groupby(['Time','symbol']).mean()
-        df = df.reset_index()
-        df = df.rename(columns = {'spread':'averageSpread'})
-        currentSpread['Time'] = currentSpread['Time'].apply(lambda x: x.time())
-        currentSpread = currentSpread.merge(df)
-        return currentSpread
-
-    def volumeStats(self,date,numberOfPreviousday=3):
-        """The minute spread is x times larger than previous m days"""
-        with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "rb") as input_file:
-            currentVolume = pickle.load(input_file)
-
-        dateList = self.getDateList()
-        index = dateList.index(date)
-        previousDateList = dateList[max(index-numberOfPreviousday,0):index]
-
         volumeList = []
-        for d in previousDateList:
-            with open(self.prefix + '\\stat\\' +str(d) + '.volume.pickle', "rb") as input_file:
-                volume = pickle.load(input_file)
-                volume['Time'] = volume['Time'].apply(lambda x: x.time())
-                volumeList.append(volume)
+        volatilityList = []
+        for symbol in symbols:
+            spread, volume, volatility = self.getSymbolStats(symbol, self.date)
+            spreadList.append(spread)
+            volumeList.append(volume)
+            volatilityList.append(volatility)
+        return pd.DataFrame(
+            list(zip(symbols, spreadList, volumeList, volatilityList)),
+            columns=["Symbol", "Spread", "Volume", "Volatility"],
+        )
 
-        df =  pd.concat(volumeList)
-        df = df.groupby(['Time','symbol']).mean()
-        df = df.reset_index()
-        df = df.rename(columns = {'volume':'averageVolume'})
-        currentVolume['Time'] = currentVolume['Time'].apply(lambda x: x.time())
-        currentVolume = currentVolume.merge(df)
-        return currentVolume
+    def medianCondtionalSpread(self):
+        """Compute median quote conditional on quote and trade updates. For question 3"""
+        symbols = self.symbolList
+        spreadOnQuoteList = []
+        spreadOnTradeList = []
+        for symbol in symbols:
+            spreadOnQuoteList.append(self.spreadOnQuoteUpdate(symbol,self.date))
+            spreadOnTradeList.append(self.spreadOnTradeUpdate(symbol,self.date))
+        return pd.DataFrame(
+            list(zip(symbols, spreadOnQuoteList, spreadOnTradeList)),
+            columns=["Symbol", "Median Spread on Quote Updates", "Median Spread on Trade Updates"],
+        )
 
-    def momentumStats(self,date,startTime,endTime):
-        with open(self.prefix + '\\stat\\' +str(date) + '.momentum.pickle', "rb") as input_file:
-            momentum = pickle.load(input_file)
+    def tstats(self):
+        """1/5 min trade return t stats. For question 4"""
+        symbols = self.symbolList
+        tstatsList = []
+        for symbol in symbols:
+            statistic = self.singleStocktradeTstats(symbol,self.date)
+            tstatsList.append(statistic)
+        return pd.DataFrame(
+            list(zip(symbols, tstatsList)),
+            columns=["Symbol", "tstats"],
+        )
 
-        return momentum
-        
-        #result = stats.ttest_ind(a=df1['return'],b=sample5min['return'],equal_var=False)
-        #return result.statistic,result.pvalue
+    def medianSpread(self,symbol,date,time):
+        """get median 1 minute spread of a symbol in a historic date and a given time."""
+        quote = self.getQuote(symbol,date)
+        t = datetime.datetime.combine(date,time)
+        quote = quote[(quote.index>=t-pd.Timedelta(seconds=30)) & (quote.index<=t+pd.Timedelta(seconds=30))]['spread']
+        return quote.median()
 
+    def medianSpreadEstimate(self,symbol,date,time):
+        """
+        Estimate the intrday 1 min median spread at any given time based on median of past 5 days 1 min median spread at the same time.
+        We provide estimate uncertainty using median abosulte deviation.If the MAD is large relative to the estimated median, the estimation has large error.
+        For question 6.
+        """
+        index = self.dateList.index(date)
+        previousDateList = self.dateList[index-5:index]
+        previousMedianList = []
+        for prevdate in previousDateList:
+            prevdate = prevdate.date()
+            try:
+                median = self.medianSpread(symbol,prevdate,time)
+                previousMedianList.append(median)
+            except IOError:
+                continue
 
+        mad = robust.mad(previousMedianList)
+        return np.median(previousMedianList),mad
 
+class BookData(DataProcessInterface):
+    """To add new data source, just implement the DataProcessInterface method.
+        We process each data source individually and can merge with other data sources based on time and symbol.
+    """
+    def __init__(self, date):
+        super(BookData,self).__init__(date)
 
+    def getLatestData(self):
+        pass
+
+    def getSymbolStas(self,symbol,date):
+        pass
 
 def test():
-
-    s = TradeSignal()
-    #spread =  s.IntralDayAbnormalSpread()
-    return s.getReturn(datetime.date(2019,9,10))
-    #return s.momentumStats(datetime.date(2019,9,10),datetime.time(10,0),datetime.time(11,0))
+    #from   pandas.tseries.offsets import BDay
+    #dateList = pd.date_range('2019-09-05', '2019-09-10', freq=BDay())
+    #for date in dateList:
+    #    date = date.date()
+    #    if date ==datetime.date(2019,9,13):
+    #        continue
+    #    print(date)
+    s = TAQData(datetime.date(2019,9,2))
+    #s.preProcessData()
+    #print(s.getQuote('000001.SZ',datetime.date(2019,9,2)))
+    #return s.dollarVolumeWeightedSpread()
+    s.singleStockTradeTstats('000001.SZ',datetime.date(2019,9,2))
+    #return s.medianSpreadEstimate('000157.SZ',datetime.date(2019,9,23),datetime.time(9,15,1))
