@@ -19,7 +19,6 @@ import matplotlib.pyplot as plt
 from builtins import zip
 import scipy.stats as stats
 import collections
-from   pandas.tseries.offsets import BDay
 from statsmodels import robust
 from scipy.interpolate import pchip
 import pickle
@@ -240,25 +239,20 @@ class TAQData(DataProcessInterface):
         volume             = trade["trade_qty"].resample("1min")
         return volume
 
-    def singleStockTradeTstats(self,symbol,date,startTime=datetime.time(9,0,0), endTime = datetime.time(15,0,0)):
+    def singleStockTradeTstats(self,symbol,date):
         """two sample t stats of 1 min return and 5 min return for single stock"""
-        startTime = datetime.datetime.combine(date,startTime)
-        endTime = datetime.datetime.combine(date,endTime)
-        trade = self.getTrade(symbol, date)
-        trade = trade[(trade.index>=startTime) & (trade.index<=endTime)]
-        sample1min = trade.resample("1min",how = 'last')
-        sample1min = sample1min.dropna()
-        sample1min['last'] = sample1min['trade_price'].shift(1)
-        sample1min = sample1min.dropna()
-        sample1min['return'] = np.log(sample1min['trade_price']) - np.log(sample1min['last'])
 
-        sample5min = trade.resample("5min",how = 'last')
-        sample5min = sample5min.dropna()
-        sample5min['last'] = sample5min['trade_price'].shift(1)
-        sample5min = sample5min.dropna()
-        sample5min['return'] = np.log(sample5min['trade_price']) - np.log(sample5min['last'])
-        result = stats.ttest_ind(a=sample1min['return'],b=sample5min['return'],equal_var=False)
-        return result.statistic,result.pvalue
+        trade = self.getTrade(symbol, date)
+        trade = trade.resample("1min",how = 'last')
+        trade = trade.dropna()
+
+        trade['1minreturn'] = np.log(trade['trade_price']).diff()
+        trade['5minreturn'] = np.log(trade['trade_price']).diff(5)
+        trade = trade.dropna()
+        trade['1/5minreturn'] = trade['1minreturn']/trade['5minreturn']
+        trade = trade.replace([np.inf, -np.inf], np.nan)
+        trade = trade.dropna()
+        return stats.ttest_1samp(trade['1/5minreturn'].values,0).statistic
 
 
     #Answers to question 1-4 and 6 below
@@ -275,13 +269,13 @@ class TAQData(DataProcessInterface):
         else:
             xs1 = np.linspace(min(xdata1),max(xdata1),num)
             xs2 = np.linspace(min(xdata2),max(xdata2),num)
-            xs =  np.append(xs1,xs2) 
+            xs =  np.append(xs1,xs2)
         t = [epoch2time(i,self.tzLocal) for i in xs]
         return t,spline(xs)
 
     def dollarVolumeWeightedSpread(self):
         """dollar volume weighted spread. Use monotonic interpolators to fit curve to avoid negative spread. For question 1"""
-        
+
         #symbols = self.getSymbolList()
         #total = 0
         #quote = []
@@ -292,7 +286,7 @@ class TAQData(DataProcessInterface):
         #    total += dollarValue
         #    quote.append(minuteQuote * dollarValue)
         #df = pd.concat(quote, axis=1)
-        
+
         with open('H:\\xuefei\\qishi\\result\\twapspread.pickle', "rb") as input_file:
             df = pickle.load(input_file)
         total = 70147567346.509949
@@ -351,14 +345,12 @@ class TAQData(DataProcessInterface):
         """1/5 min trade return t stats. For question 4"""
         symbols = self.symbolList
         tstatsList = []
-        pvalueList = []
         for symbol in symbols:
-            statistic,pvalue = self.singleStocktradeTstats(symbol,self.date)
+            statistic = self.singleStocktradeTstats(symbol,self.date)
             tstatsList.append(statistic)
-            pvalueList.append(pvalue)
         return pd.DataFrame(
-            list(zip(symbols, tstatsList, pvalueList)),
-            columns=["Symbol", "tstats", "pvalue"],
+            list(zip(symbols, tstatsList)),
+            columns=["Symbol", "tstats"],
         )
 
     def medianSpread(self,symbol,date,time):
@@ -411,7 +403,7 @@ def test():
     #    print(date)
     s = TAQData(datetime.date(2019,9,2))
     #s.preProcessData()
-    print(s.getQuote('000001.SZ',datetime.date(2019,9,2)))
-    return s.dollarVolumeWeightedSpread()
-
+    #print(s.getQuote('000001.SZ',datetime.date(2019,9,2)))
+    #return s.dollarVolumeWeightedSpread()
+    s.singleStockTradeTstats('000001.SZ',datetime.date(2019,9,2))
     #return s.medianSpreadEstimate('000157.SZ',datetime.date(2019,9,23),datetime.time(9,15,1))
