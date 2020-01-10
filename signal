@@ -17,21 +17,20 @@ import os.path
 import pytz
 
 class TradeSignal(object):
-    def __init__(self,date,prefix = "H:\\xuefei\\qishi\\qishi_data"):
-        self.date = date
+    def __init__(self,prefix = "H:\\xuefei\\qishi\\qishi_data"):
         self.prefix = prefix
         self.lunchTime = [datetime.time(11, 30, 0), datetime.time(13, 0, 0)]
         self.tzLocal = pytz.timezone("Asia/Shanghai")
 
-    def lunchBreak(self):
+    def lunchBreak(self,date):
         """lunch break in epoch time"""
-        t = [datetime.datetime.combine(self.date, time) for time in self.lunchTime]
+        t = [datetime.datetime.combine(date, time) for time in self.lunchTime]
         return [time2epoch(i,self.tzLocal) for i in t]
 
 
     def getSpread(self,date):
         quote = pd.read_csv(self.prefix +"\\"  + str(date) + ".quote.csv")
-        lowerTime, upperTime = self.lunchBreak()
+        lowerTime, upperTime = self.lunchBreak(date)
         quote = quote[(quote.recv_time < lowerTime) | (quote.recv_time > upperTime)]
         quote = quote[ (quote["ask_price"] > 0) & (quote["bid_price"] > 0)]  # if only bid or ask exists, there is no spread
         quote["spread"] = (quote["ask_price"] - quote["bid_price"]) / (quote["ask_price"] + quote["bid_price"])
@@ -39,12 +38,13 @@ class TradeSignal(object):
         quote = quote[["Time", "symbol", "spread"]].set_index("Time")
         quote = quote.groupby('symbol').resample('1min')
         quote = quote.dropna()
+        quote = quote.reset_index()
         with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "wb") as output_file:
             pickle.dump(quote,output_file)
 
     def getVolume(self,date):
-        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv") 
-        lowerTime, upperTime = self.lunchBreak()
+        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv")
+        lowerTime, upperTime = self.lunchBreak(date)
         trade = trade[(trade.recv_time < lowerTime) | (trade.recv_time > upperTime)]
         trade = trade.groupby(["recv_time", "symbol", "trade_price"]).sum().reset_index()
         trade["Time"] = trade["recv_time"].apply(epoch2time)
@@ -52,60 +52,55 @@ class TradeSignal(object):
         trade = trade.rename(columns = {'trade_qty':'volume'})
         trade = trade.groupby('symbol').resample('1min',how = 'sum')
         trade = trade.dropna()
+        trade = trade.reset_index()
         with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "wb") as output_file:
             pickle.dump(trade,output_file)
 
 
     def getReturn(self,date):
-        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv") 
-        lowerTime, upperTime = self.lunchBreak()
+        trade = pd.read_csv(self.prefix +"\\"  + str(date) + ".trade.csv")
+        lowerTime, upperTime = self.lunchBreak(date)
         trade = trade[(trade.recv_time < lowerTime) | (trade.recv_time > upperTime)]
         trade = trade.groupby(["recv_time", "symbol", "trade_price"]).sum().reset_index()
         trade["Time"] = trade["recv_time"].apply(epoch2time)
         trade = trade[["Time", "symbol", "trade_price"]].set_index("Time")
         trade = trade.groupby('symbol')
 
-        trade1min = trade.resample('min',how = 'last')
-        trade1min  = trade1min .dropna()
-        trade1min['return'] = np.log(trade1min['trade_price']).diff()
-        trade1min = trade1min.dropna()
-        trade1min = trade1min.reset_index()[["Time", "symbol",'return']]
+        trade = trade.resample('min',how = 'last')
+        trade  = trade .dropna()
+        trade['1minreturn'] = np.log(trade['trade_price']).diff()
+        trade['5minreturn'] = np.log(trade['trade_price']).diff(5)
+        trade = trade.dropna()
+        trade['1/5minreturn'] = trade['1minreturn']/trade['5minreturn']
+        trade = trade.replace([np.inf, -np.inf], np.nan)
+        trade = trade.dropna()
+        trade = trade.reset_index()
+        with open(self.prefix + '\\stat\\' +str(date) + '.momentum.pickle', "wb") as output_file:
+            pickle.dump(trade,output_file)
 
-        trade5min = trade.resample('5min',how = 'last')
-        trade5min  = trade5min .dropna()
-        trade5min['return'] = np.log(trade5min['trade_price']).diff()
-        trade5min = trade5min.dropna()
-        trade5min = trade5min.reset_index()[["Time", "symbol",'return']]
 
-        with open(self.prefix + '\\stat\\' +str(date) + '.1minreturn.pickle', "wb") as output_file:
-            pickle.dump(trade1min,output_file)
-
-        with open(self.prefix + '\\stat\\' +str(date) + '.5minreturn.pickle', "wb") as output_file:
-            pickle.dump(trade5min,output_file)
-
-    def processData(self):
-        self.getSpread(self.date)
-        self.getVolume(self.date)
-        self.getReturn(self.date)
+    def processData(self,date):
+        self.getSpread(date)
+        self.getVolume(date)
+        self.getReturn(date)
 
     def getDateList(self):
         """Get all date lists in universe"""
         return sorted([datetime.datetime.strptime(i, '%Y-%m-%d').date() for i in os.listdir(self.prefix + "\\" + "splitData")])
 
-    def spreadStats(self,numberOfPreviousday=3):
+    def spreadStats(self,date,numberOfPreviousday=3):
         """The minute spread is x times larger than previous m days"""
-        with open(self.prefix + '\\stat\\' +str(self.date) + '.spread.pickle', "rb") as input_file:
+        with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "rb") as input_file:
             currentSpread = pickle.load(input_file)
-        
+
         dateList = self.getDateList()
-        index = dateList.index(self.date)
+        index = dateList.index(date)
         previousDateList = dateList[max(index-numberOfPreviousday,0):index]
-        
+
         spreadList = []
-        for date in previousDateList:
-            with open(self.prefix + '\\stat\\' +str(date) + '.spread.pickle', "rb") as input_file:
+        for d in previousDateList:
+            with open(self.prefix + '\\stat\\' +str(d) + '.spread.pickle', "rb") as input_file:
                 spread = pickle.load(input_file)
-                spread = spread.reset_index()
                 spread['Time'] = spread['Time'].apply(lambda x: x.time())
                 spreadList.append(spread)
 
@@ -113,25 +108,23 @@ class TradeSignal(object):
         df = df.groupby(['Time','symbol']).mean()
         df = df.reset_index()
         df = df.rename(columns = {'spread':'averageSpread'})
-        currentSpread = currentSpread.reset_index()
         currentSpread['Time'] = currentSpread['Time'].apply(lambda x: x.time())
         currentSpread = currentSpread.merge(df)
         return currentSpread
 
-    def volumeStats(self,numberOfPreviousday=3):
+    def volumeStats(self,date,numberOfPreviousday=3):
         """The minute spread is x times larger than previous m days"""
-        with open(self.prefix + '\\stat\\' +str(self.date) + '.volume.pickle', "rb") as input_file:
+        with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "rb") as input_file:
             currentVolume = pickle.load(input_file)
-        
+
         dateList = self.getDateList()
-        index = dateList.index(self.date)
+        index = dateList.index(date)
         previousDateList = dateList[max(index-numberOfPreviousday,0):index]
-        
+
         volumeList = []
-        for date in previousDateList:
-            with open(self.prefix + '\\stat\\' +str(date) + '.volume.pickle', "rb") as input_file:
+        for d in previousDateList:
+            with open(self.prefix + '\\stat\\' +str(d) + '.volume.pickle', "rb") as input_file:
                 volume = pickle.load(input_file)
-                volume = volume.reset_index()
                 volume['Time'] = volume['Time'].apply(lambda x: x.time())
                 volumeList.append(volume)
 
@@ -139,24 +132,26 @@ class TradeSignal(object):
         df = df.groupby(['Time','symbol']).mean()
         df = df.reset_index()
         df = df.rename(columns = {'volume':'averageVolume'})
-        currentVolume = currentVolume.reset_index()
         currentVolume['Time'] = currentVolume['Time'].apply(lambda x: x.time())
         currentVolume = currentVolume.merge(df)
         return currentVolume
 
-    def momentumStats(self,startTime,delta):
-        with open(self.prefix + '\\stat\\' +str(self.date) + '.spread.pickle', "rb") as input_file:
-            currentSpread = pickle.load(input_file)
+    def momentumStats(self,date,startTime,endTime):
+        with open(self.prefix + '\\stat\\' +str(date) + '.momentum.pickle', "rb") as input_file:
+            momentum = pickle.load(input_file)
 
-
+        return momentum
         
+        #result = stats.ttest_ind(a=df1['return'],b=sample5min['return'],equal_var=False)
+        #return result.statistic,result.pvalue
+
 
 
 
 
 def test():
 
-    s = TradeSignal(datetime.date(2019,9,10))
+    s = TradeSignal()
     #spread =  s.IntralDayAbnormalSpread()
-    #return s.getSpread(s.date)
     return s.getReturn(datetime.date(2019,9,10))
+    #return s.momentumStats(datetime.date(2019,9,10),datetime.time(10,0),datetime.time(11,0))
