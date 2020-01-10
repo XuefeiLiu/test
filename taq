@@ -16,16 +16,29 @@ import os
 import os.path
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
 from builtins import zip
 import scipy.stats as stats
 import collections
 from   pandas.tseries.offsets import BDay
 from statsmodels import robust
+from scipy.interpolate import pchip
+import pickle
 
 Quote = collections.namedtuple('Quote',['recv_time','symbol','ask_price', 'ask_size', 'bid_price', 'bid_size'])
 
 Trade = collections.namedtuple('Trade',['recv_time','symbol','trade_price', 'trade_qty'])
+
+def epoch2time(epoch,tzLocal = pytz.timezone("Asia/Shanghai")):
+    """convert epoch time to local time"""
+    epoch = epoch / 1000000.0
+    timeString = datetime.datetime.fromtimestamp(epoch, tzLocal).strftime("%Y-%m-%d %H:%M:%S.%f")
+    time = datetime.datetime.strptime(timeString, "%Y-%m-%d %H:%M:%S.%f")
+    return time
+
+def time2epoch(t,tzLocal = pytz.timezone("Asia/Shanghai")):
+    """convert local time to epoch time"""
+    t = tzLocal.localize(t)
+    return int(calendar.timegm(t.utctimetuple()) * 1000000)
 
 class DataProcessInterface(object):
     def __init__(self,date):
@@ -54,22 +67,22 @@ class TAQData(DataProcessInterface):
         self.mergedSeries = pd.DataFrame()
 
     #time util func
-    def epoch2time(self, epoch):
-        """convert epoch time to local time"""
-        epoch = epoch / 1000000.0
-        timeString = datetime.datetime.fromtimestamp(epoch, self.tzLocal).strftime("%Y-%m-%d %H:%M:%S.%f")
-        time = datetime.datetime.strptime(timeString, "%Y-%m-%d %H:%M:%S.%f")
-        return time
+    #def epoch2time(self, epoch):
+    #    """convert epoch time to local time"""
+    #    epoch = epoch / 1000000.0
+    #    timeString = datetime.datetime.fromtimestamp(epoch, self.tzLocal).strftime("%Y-%m-%d %H:%M:%S.%f")
+    #    time = datetime.datetime.strptime(timeString, "%Y-%m-%d %H:%M:%S.%f")
+    #    return time
 
-    def time2epoch(self, t):
-        """convert local time to epoch time"""
-        t = self.tzLocal.localize(t)
-        return int(calendar.timegm(t.utctimetuple()) * 1000000)
+    #def time2epoch(self, t):
+    #    """convert local time to epoch time"""
+    #    t = self.tzLocal.localize(t)
+    #    return int(calendar.timegm(t.utctimetuple()) * 1000000)
 
     def lunchBreak(self):
         """lunch break in epoch time"""
         t = [datetime.datetime.combine(self.date, time) for time in self.lunchTime]
-        return [self.time2epoch(i) for i in t]
+        return [time2epoch(i,self.tzLocal) for i in t]
 
     def preProcessData(self):
         """If the data is stored already, we can process them all together which is the case for this exercise.
@@ -137,7 +150,7 @@ class TAQData(DataProcessInterface):
             ["recv_time", "ask_price", "ask_size", "bid_price", "bid_size"]
         ]  # if only bid or ask exists, there is no spread
         quote["spread"] = quote["ask_price"] - quote["bid_price"]
-        quote["Time"] = quote["recv_time"].apply(self.epoch2time)
+        quote["Time"] = quote["recv_time"].apply(epoch2time,args = (self.tzLocal,) )
         quote = quote[["Time", "spread", "ask_price", "ask_size", "bid_price", "bid_size"]].set_index("Time")
         return quote
 
@@ -145,7 +158,7 @@ class TAQData(DataProcessInterface):
         """get the trade data given date and symbol"""
         data = pd.read_csv(self.prefix + "\\" + "splitData\\" + str(date) + "\\" + symbol + "\\" + "rawdata.csv")
         trade = data[(data["trade_price"] > 0)][["recv_time", "trade_price", "trade_qty"]]
-        trade["Time"] = trade["recv_time"].apply(self.epoch2time)
+        trade["Time"] = trade["recv_time"].apply(epoch2time,args = (self.tzLocal,))
         trade = trade[["Time", "trade_price", "trade_qty"]].set_index("Time")
         return trade
 
@@ -209,18 +222,15 @@ class TAQData(DataProcessInterface):
                 Suppose threre are N points in the 1 minute bucket, t1,t2,...,tn.
                 The start and end of the interval are t0 and tN, tN-t0 = 1 min.
                 The the time weighted average is defined as:
-                sum(BAS_1 * (t1-t0) + BAS_i * (t2-t1) +....+BAS_n * (tn-t_n-1))/(tN - t0)
+                sum(BAS_1 * (t2-t1) + BAS_2 * (t3-t2) +....+BAS_n * (tN-t_n))/(tN - t1)
 
             """
             if df.size == 0: return
-            timestep = 1*60*1000000
-            indexes = df.index - (df.index[-1] - pd.Timedelta(seconds=df.index[-1].second,microseconds = df.index[-1].microsecond))
-            microseconds = indexes.seconds*1000000 + indexes.microseconds
-            weight = [microseconds[n]/timestep if n == 0 else (microseconds[n] - microseconds[n - 1])/timestep
-                  for n, k in enumerate(microseconds)]
-            return np.sum(weight*df.values)
-        minuteQuote = quote['spread'].resample("1min",how = func)  
-
+            #lastIndex is the minute boundary tN, like 2019-09-02 09:35:00
+            lastIndex = df.index[-1] - pd.Timedelta(seconds=df.index[-1].second,microseconds = df.index[-1].microsecond) + pd.Timedelta(minutes=1)
+            df = df.append(pd.Series(0,index = [lastIndex]))
+            return np.average(df.values[:-1], weights=np.diff(df.index.asi8))
+        minuteQuote = quote['spread'].resample("1min",how = func)
         return minuteQuote
 
 
@@ -254,31 +264,59 @@ class TAQData(DataProcessInterface):
     #Answers to question 1-4 and 6 below
 
 
-    def dollarVolumeWeightedSpread(self):
-        """dollar volume weighted spread. For question 1"""
-        symbols = self.getSymbolList()
-        total = 0
-        quote = []
-        for symbol in symbols:
-            minuteQuote = self.singleStockMinSpread(symbol,self.date)
-            minuteQuote = minuteQuote.dropna()
-            dollarValue = self.singleStockDollarValue(symbol,self.date)
-            total += dollarValue
-            quote.append(minuteQuote * dollarValue)
-        result = pd.concat(quote, axis=1).fillna(method="ffill").sum(axis=1) / total
-        def func(x, a, b, c):
-            """using an exponetional function to fit the curve since the spread decays very fast from 9-9:30am"""
-            return a * np.exp(-b * x) + c
+    def curveFit(self,df,num,premarket):
+        """fit curve with cubic spline"""
+        xdata1 = [time2epoch(i,self.tzLocal) for i in df.index if i.time() <=datetime.time(11,30) ]
+        xdata2 = [time2epoch(i,self.tzLocal) for i in df.index if i.time() >=datetime.time(13,0) ]
+        xdata = xdata1+xdata2
+        spline = pchip(xdata, df.spread)
+        if premarket:
+            xs = np.linspace(min(xdata1),max(xdata1),num)
+        else:
+            xs1 = np.linspace(min(xdata1),max(xdata1),num)
+            xs2 = np.linspace(min(xdata2),max(xdata2),num)
+            xs =  np.append(xs1,xs2) 
+        t = [epoch2time(i,self.tzLocal) for i in xs]
+        return t,spline(xs)
 
-        t = list(result.index)
-        xdata = np.linspace(1, result.shape[0], result.shape[0])
-        ydata = result.values
-        popt, pcov = curve_fit(func, xdata, ydata)
-        plt.plot(t, ydata, "b-", label="spread")
-        plt.plot(t, func(xdata, *popt), "g--", label="fit: a=%5.3f, b=%5.3f, c=%5.3f" % tuple(popt))
-        plt.legend()
+    def dollarVolumeWeightedSpread(self):
+        """dollar volume weighted spread. Use monotonic interpolators to fit curve to avoid negative spread. For question 1"""
+        
+        #symbols = self.getSymbolList()
+        #total = 0
+        #quote = []
+        #for symbol in symbols:
+        #    minuteQuote = self.singleStockMinSpread(symbol,self.date)
+        #    minuteQuote = minuteQuote.dropna()
+        #    dollarValue = self.singleStockDollarValue(symbol,self.date)
+        #    total += dollarValue
+        #    quote.append(minuteQuote * dollarValue)
+        #df = pd.concat(quote, axis=1)
+        
+        with open('H:\\xuefei\\qishi\\result\\twapspread.pickle', "rb") as input_file:
+            df = pickle.load(input_file)
+        total = 70147567346.509949
+        df = df[(df.index<=datetime.datetime.combine(self.date,datetime.time(11,30))) | (df.index>=datetime.datetime.combine(self.date,datetime.time(13,0)))]
+        result = df.fillna(method="ffill").sum(axis=1) / total
+
+        result1 = result[result.index<=datetime.datetime.combine(self.date,datetime.time(9,30))]
+        result2 = result[result.index>datetime.datetime.combine(self.date,datetime.time(9,30))]
+
+        result1 = pd.DataFrame(result1,columns = ['spread'])
+        result2 = pd.DataFrame(result2,columns = ['spread'])
+
+        plt.figure(figsize=(6.5, 4))
+        plt.plot(result1.index, result1.spread, 'o', label='data')
+        x1,y1 = self.curveFit(result1,30,True)
+        plt.plot(x1,y1 )
         plt.show()
-        return result
+
+        plt.figure(figsize=(6.5, 4))
+        plt.plot(result2.index, result2.spread, 'o', label='data')
+        x2,y2 = self.curveFit(result2,120,False)
+        plt.plot(x2,y2 )
+        plt.show()
+        return result1,result2
 
     def minuteStats(self):
         """Compute daily average of minute stats: volume, spread, volatility. For question 2"""
@@ -371,7 +409,9 @@ def test():
     #    if date ==datetime.date(2019,9,13):
     #        continue
     #    print(date)
-    s = TAQData(datetime.date(2019,9,16))
+    s = TAQData(datetime.date(2019,9,2))
     #s.preProcessData()
-    return s.dateList
+    print(s.getQuote('000001.SZ',datetime.date(2019,9,2)))
+    return s.dollarVolumeWeightedSpread()
+
     #return s.medianSpreadEstimate('000157.SZ',datetime.date(2019,9,23),datetime.time(9,15,1))
